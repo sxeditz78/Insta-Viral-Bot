@@ -275,7 +275,7 @@ async def send_media_to_user(bot: Bot, chat_id: int, media: dict, stats: dict, o
             message_id=media["message_id"],
             caption="⏱️ 10 min mein delete ho jayega",
             reply_markup=keyboard,
-            protect_content=True,
+            
         )
         asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
         return msg.message_id
