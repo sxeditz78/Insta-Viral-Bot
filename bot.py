@@ -298,7 +298,7 @@ async def check_ban(update: Update, ctx=None) -> bool:
             await update.message.reply_text(msg_text, parse_mode="Markdown")
         elif update.callback_query:
             await update.callback_query.answer("💎 Premium expire! Admin se contact karein.", show_alert=True)
-        # ✅ Har banned user ke liye admin ko notify karo
+        # ✅ Har banned user ke liye admin ko notify karo with buttons
         if ctx:
             try:
                 await ctx.bot.send_message(
@@ -307,10 +307,10 @@ async def check_ban(update: Update, ctx=None) -> bool:
                         f"🔄 *Access Request!*\n\n"
                         f"👤 Name: *{username}*\n"
                         f"🆔 User ID: `{user_id}`\n\n"
-                        f"Access dene ke liye:\n"
-                        f"`/approve {user_id}`"
+                        f"Access dena hai?"
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=approval_keyboard(user_id)
                 )
             except TelegramError:
                 pass
