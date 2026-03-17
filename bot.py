@@ -178,6 +178,8 @@ async def approve_user(user_id: int):
             UPDATE users SET is_approved = TRUE, is_rejected = FALSE,
             approved_at = NOW(), expires_at = $2 WHERE user_id = $1
         """, user_id, expires)
+        # ✅ Ban bhi hatao automatically
+        await conn.execute("DELETE FROM banned_users WHERE user_id = $1", user_id)
 
 async def reject_user(user_id: int):
     async with pool.acquire() as conn:
