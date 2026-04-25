@@ -366,7 +366,7 @@ async def send_media_to_user(
                     chat_id=chat_id,
                     from_chat_id=SOURCE_CHAT_ID,
                     message_id=media["message_id"],
-                    caption="⏱️ 10 min mein delete ho jayega",
+                    caption="⏱️ Auto Delete in 10 min",
                     reply_markup=keyboard,
                 )
                 # Delete old only after new is sent — smoother replace
@@ -477,7 +477,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     expiry_line  = f"📅 Expiry: *{exp_date_str}* ({days_left} din baaki)\n" if days_left is not None else ""
 
     if pos:
-        welcome = f"👋 *Wapas aaye!*\n\n{expiry_line}\nWohi se shuru kar rahe hain jahan chhoda tha ⬇️"
+        welcome = f"👋 *WELCOME AGAIN!*\n\n{expiry_line}\nLets Continue Video ⬇️"
     else:
         welcome = f"🎉 *Welcome!*\n\n{expiry_line}\n▶️ Next dabao aur enjoy karo!"
     await update.message.reply_text(welcome, parse_mode="Markdown")
