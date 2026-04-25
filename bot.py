@@ -22,7 +22,7 @@ DATABASE_URL     = os.environ["DATABASE_URL"]
 SOURCE_CHAT_ID   = int(os.environ["SOURCE_CHAT_ID"])
 ADMIN_ID         = int(os.environ["ADMIN_ID"])
 ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@SynaX_69")
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@Olly_077")   # support button username
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@SynaX_69")   # support button username
 
 AUTO_DELETE_SECONDS = 600
 REPEAT_CHANCE       = 0.02   # 2% repeat chance
@@ -349,53 +349,82 @@ def media_keyboard() -> InlineKeyboardMarkup:
         ])
     return InlineKeyboardMarkup(rows)
 
+async def delete_missing_media(media_id: int):
+    """Remove a media entry from DB when Telegram says the source message is gone."""
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM media WHERE id = $1", media_id)
+        await conn.execute("DELETE FROM user_history WHERE media_id = $1", media_id)
+        await conn.execute(
+            "UPDATE user_position SET current_media_id = NULL WHERE current_media_id = $1",
+            media_id
+        )
+    logger.warning(f"🗑️ Removed missing media id={media_id} from DB")
+
+async def _copy_media(bot: Bot, chat_id: int, media: dict) -> "telegram.Message":
+    """Raw copy — raises TelegramError on failure."""
+    return await bot.copy_message(
+        chat_id=chat_id,
+        from_chat_id=SOURCE_CHAT_ID,
+        message_id=media["message_id"],
+        caption="⏱️ 10 min mein delete ho jayega",
+        reply_markup=media_keyboard(),
+    )
+
 async def send_media_to_user(
     bot: Bot,
     chat_id: int,
     media: dict,
     old_msg_id: int | None = None,
     is_prev: bool = False,
+    user_id: int | None = None,   # needed for retry fallback on next
+    _retries: int = 0,
 ) -> int | None:
+    MAX_RETRIES = 10
     keyboard = media_keyboard()
-    try:
-        # For prev: try to EDIT the existing message in-place (no delete flash)
-        # For next: delete old, send new (same as before)
-        if is_prev and old_msg_id:
-            try:
-                msg = await bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=SOURCE_CHAT_ID,
-                    message_id=media["message_id"],
-                    caption="⏱️ Auto Delete in 10 min",
-                    reply_markup=keyboard,
-                )
-                # Delete old only after new is sent — smoother replace
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
-                except TelegramError:
-                    pass
-                asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
-                return msg.message_id
-            except TelegramError as e:
-                logger.error(f"send_media prev error: {e}")
-                return None
 
-        # Next flow: delete first, then send
-        if old_msg_id:
+    # ── Try to send the requested media ────────────────────────────────────────
+    try:
+        if is_prev and old_msg_id:
+            # Send first, then delete old → smooth replace, no flash
+            msg = await _copy_media(bot, chat_id, media)
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
             except TelegramError:
                 pass
-        msg = await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=SOURCE_CHAT_ID,
-            message_id=media["message_id"],
-            caption="⏱️ Auto Delete in 10 min",
-            reply_markup=keyboard,
-        )
+        else:
+            # Next / start flow: delete old first
+            if old_msg_id:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+                except TelegramError:
+                    pass
+            msg = await _copy_media(bot, chat_id, media)
+
         asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
         return msg.message_id
+
     except TelegramError as e:
+        err = str(e).lower()
+        if "message to copy not found" in err or "message not found" in err:
+            # Source message deleted — clean DB and retry with a fresh media
+            await delete_missing_media(media["id"])
+            if _retries >= MAX_RETRIES or user_id is None:
+                logger.error(f"❌ Max retries reached or no user_id for chat {chat_id}")
+                return None
+            # Get next available media and retry
+            next_media = await get_next_media(user_id)
+            if not next_media:
+                logger.warning(f"⚠️ No media left after removing missing entry for chat {chat_id}")
+                return None
+            logger.info(f"🔄 Retry {_retries + 1}/{MAX_RETRIES} with media id={next_media['id']}")
+            await mark_seen(user_id, next_media["id"])
+            return await send_media_to_user(
+                bot, chat_id, next_media,
+                old_msg_id=None,   # already handled above
+                is_prev=False,
+                user_id=user_id,
+                _retries=_retries + 1,
+            )
         logger.error(f"send_media_to_user error: {e}")
         return None
 
@@ -477,7 +506,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     expiry_line  = f"📅 Expiry: *{exp_date_str}* ({days_left} din baaki)\n" if days_left is not None else ""
 
     if pos:
-        welcome = f"👋 *WELCOME AGAIN!*\n\n{expiry_line}\nLets Continue Video ⬇️"
+        welcome = f"👋 *Wapas aaye!*\n\n{expiry_line}\nWohi se shuru kar rahe hain jahan chhoda tha ⬇️"
     else:
         welcome = f"🎉 *Welcome!*\n\n{expiry_line}\n▶️ Next dabao aur enjoy karo!"
     await update.message.reply_text(welcome, parse_mode="Markdown")
@@ -486,7 +515,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with pool.acquire() as conn:
             media = await conn.fetchrow("SELECT id, message_id, media_type FROM media WHERE id = $1", pos["current_media_id"])
         if media:
-            new_msg_id = await send_media_to_user(ctx.bot, user_id, dict(media), old_msg_id=pos.get("bot_message_id"))
+            new_msg_id = await send_media_to_user(ctx.bot, user_id, dict(media), old_msg_id=pos.get("bot_message_id"), user_id=user_id)
             if new_msg_id:
                 await save_position(user_id, media["id"], new_msg_id)
             return
@@ -495,7 +524,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not media:
         await update.message.reply_text("⚠️ Abhi koi media available nahi hai.")
         return
-    new_msg_id = await send_media_to_user(ctx.bot, user_id, media)
+    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, user_id=user_id)
     if new_msg_id:
         await mark_seen(user_id, media["id"])
         await save_position(user_id, media["id"], new_msg_id)
@@ -600,7 +629,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     old_msg_id = pos["bot_message_id"] if pos else None
-    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, old_msg_id=old_msg_id, is_prev=is_prev)
+    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, old_msg_id=old_msg_id, is_prev=is_prev, user_id=user_id)
     if new_msg_id:
         await save_position(user_id, media["id"], new_msg_id)
 
