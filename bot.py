@@ -119,6 +119,15 @@ async def init_db():
                 notified_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Persistent scheduled message deletions — survives restarts
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_deletes (
+                id          SERIAL PRIMARY KEY,
+                chat_id     BIGINT NOT NULL,
+                message_id  BIGINT NOT NULL,
+                delete_at   TIMESTAMP NOT NULL
+            )
+        """)
     logger.info("✅ Database initialized")
 
 
@@ -412,7 +421,7 @@ async def send_media_to_user(
                 await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
             except TelegramError:
                 pass
-        _fire_and_forget(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
+        await auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
         return msg.message_id
 
     except TelegramError as e:
@@ -438,11 +447,30 @@ async def send_media_to_user(
         return None
 
 async def auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int):
-    try:
-        await asyncio.sleep(delay)
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except (TelegramError, asyncio.CancelledError):
-        pass
+    """DB-backed: schedule deletion so it survives bot restarts."""
+    delete_at = datetime.utcnow() + timedelta(seconds=delay)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO scheduled_deletes (chat_id, message_id, delete_at) VALUES ($1, $2, $3)",
+            chat_id, message_id, delete_at
+        )
+
+async def deletion_loop(bot: Bot):
+    """Runs every 30 seconds — deletes messages whose time has come."""
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                due = await conn.fetch(
+                    "DELETE FROM scheduled_deletes WHERE delete_at <= NOW() RETURNING chat_id, message_id"
+                )
+            for row in due:
+                try:
+                    await bot.delete_message(chat_id=row["chat_id"], message_id=row["message_id"])
+                except TelegramError:
+                    pass  # already deleted or not found — ignore
+        except Exception as e:
+            logger.error(f"deletion_loop error: {e}")
+        await asyncio.sleep(30)
 
 
 # ─── Ban Check ─────────────────────────────────────────────────────────────────
@@ -725,7 +753,7 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     from_chat_id=update.effective_chat.id,
                     message_id=replied_msg.message_id,
                 )
-                _fire_and_forget(auto_delete(ctx.bot, uid, sent.message_id, 86400))
+                await auto_delete(ctx.bot, uid, sent.message_id, 86400)
                 success += 1
             except TelegramError:
                 failed += 1
@@ -795,7 +823,7 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     entities=shifted_entities if shifted_entities else None,
                 )
             # Auto-delete broadcast after 24 hours silently
-            _fire_and_forget(auto_delete(ctx.bot, uid, sent.message_id, 86400))
+            await auto_delete(ctx.bot, uid, sent.message_id, 86400)
             success += 1
         except TelegramError:
             failed += 1
@@ -978,18 +1006,19 @@ def main():
     async def post_init(app: Application):
         await init_db()
         await set_bot_commands(app.bot)
-        # Store task on app so it's tracked and cancelled cleanly on shutdown
-        app.bot_data["expiry_task"] = _fire_and_forget(expiry_checker(app.bot))
-        logger.info("⏰ Expiry checker started")
+        app.bot_data["expiry_task"]   = _fire_and_forget(expiry_checker(app.bot))
+        app.bot_data["deletion_task"] = _fire_and_forget(deletion_loop(app.bot))
+        logger.info("⏰ Expiry checker + deletion loop started")
 
     async def post_shutdown(app: Application):
-        task = app.bot_data.get("expiry_task")
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for key in ("expiry_task", "deletion_task"):
+            task = app.bot_data.get(key)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start",     start))
